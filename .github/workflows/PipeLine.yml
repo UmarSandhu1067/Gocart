@@ -1,0 +1,75 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Validate application
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build application
+        run: npm run build
+
+  deploy:
+    name: Deploy to AWS Amplify
+    needs: build
+    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check AWS configuration
+        env:
+          AWS_ROLE_ARN: ${{ secrets.AWS_ROLE_ARN }}
+          AWS_REGION: ${{ vars.AWS_REGION }}
+          AMPLIFY_APP_ID: ${{ vars.AMPLIFY_APP_ID }}
+        run: |
+          if [ -z "$AWS_ROLE_ARN" ] || [ -z "$AWS_REGION" ] || [ -z "$AMPLIFY_APP_ID" ]; then
+            echo "Configure the AWS_ROLE_ARN secret and AWS_REGION and AMPLIFY_APP_ID repository variables."
+            exit 1
+          fi
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Start and monitor Amplify deployment
+        run: |
+          JOB_ID=$(aws amplify start-job --app-id "${{ vars.AMPLIFY_APP_ID }}" --branch-name main --job-type RELEASE --query 'jobSummary.jobId' --output text)
+          echo "Started Amplify job $JOB_ID"
+          while true; do
+            STATUS=$(aws amplify get-job --app-id "${{ vars.AMPLIFY_APP_ID }}" --branch-name main --job-id "$JOB_ID" --query 'job.summary.status' --output text)
+            echo "Amplify deployment status: $STATUS"
+            case "$STATUS" in
+              SUCCEED) break ;;
+              FAILED|CANCELLED) exit 1 ;;
+            esac
+            sleep 15
+          done
